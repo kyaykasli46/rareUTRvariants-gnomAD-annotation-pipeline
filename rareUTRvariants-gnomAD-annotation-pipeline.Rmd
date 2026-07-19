@@ -1,0 +1,583 @@
+---
+title: "Rare UTR Variants — WGS Annotation Pipeline"
+author: "rareUTRvariants Project"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  eval    = FALSE   # Set eval=TRUE for each step when running sequentially
+)
+```
+
+# Overview
+
+This pipeline processes whole-genome sequencing (WGS) data to identify and annotate
+rare UTR variants using gnomAD v3.1.2 population frequency data.
+
+The main goal is to start from cohort-level variant calls, convert them into a
+standardized hg38-based representation, and then attach population frequency fields
+from gnomAD for downstream filtering. A key design principle of the workflow is that
+all matching steps are based on a normalized variant identifier (`canonical_id`), which
+helps reduce ambiguity when the same variant can be represented in more than one way.
+
+The pipeline starts from a pre-merged input table (`input_variants.xlsx`) containing
+variants from one or more WGS cohorts, with the following sheets:
+
+- `Analysis Info` — run metadata
+- `Quality Data` — per-variant quality metrics
+- `Affected only all` — variant calls for affected individuals (primary input)
+
+**Workflow summary:**
+
+| Step | Tool | Description |
+|---|---|---|
+| 1 | R | Generate BED file from hg19 coordinates |
+| 2 | Bash | LiftOver: hg19 → hg38 |
+| 3 | R | Integrate hg38 coordinates into main table |
+| 4 | R | Build VCF with anchor bases for indels |
+| 5 | Bash | Normalize VCF (bcftools norm) |
+| 6 | R | Build canonical_id bridge table |
+| 7 | R | Add canonical_id to main table |
+| 8 | R | Extract unique variants |
+| 9 | R | Generate per-chromosome region files |
+| 10 | Bash | Query gnomAD VCF files (bcftools query) |
+| 11 | R | Combine gnomAD hit files |
+| 12 | R | Annotate main table with gnomAD frequencies |
+| 13 | R | Add variant_num (patient recurrence) → ready_for_filtration |
+
+**Required input files:**
+
+| File | Description |
+|---|---|
+| `input_variants.xlsx` | Pre-merged WGS variant table (`Affected only all` sheet) |
+| `hg19ToHg38.over.chain` | UCSC LiftOver chain file |
+| `reference.fa` + `reference.fa.fai` | GRCh38 reference genome (FASTA + index) |
+| `gnomad.genomes.v3.1.2.sites.chrN.vcf.bgz` | gnomAD v3.1.2 genome VCF files (per chromosome) |
+
+**Output files:**
+
+| File | Content |
+|---|---|
+| `step01_bed_hg19.txt` | BED file with hg19 coordinates |
+| `step02_hg38_coords.xlsx` | Main table with hg38 coordinates |
+| `step03_raw.vcf` | Raw VCF (hg38) |
+| `step04_normalized.vcf.gz` | Normalized and indexed VCF |
+| `step05_bridge.csv` | canonical_id bridge table |
+| `step06_with_canonical_id.xlsx` | Main table with canonical_id |
+| `step07_unique_variants.csv` | Unique variant list |
+| `step08_gnomad_annotations.csv` | gnomAD frequency annotations |
+| `step09_annotated.xlsx` | Final annotated table with `ready_for_filtration` sheet |
+
+---
+
+# Required Packages
+
+```{r packages}
+# R packages
+library(readxl)
+library(dplyr)
+library(openxlsx)
+library(Biostrings)
+library(BSgenome)
+library(stringr)
+library(tidyr)
+library(purrr)
+```
+
+---
+
+# Step 1 — Generate BED File (R)
+
+hg19 coordinates from the input table are converted to BED format for use with UCSC liftOver.
+BED format is 0-based, so `Start - 1` is applied to the start position. The `name`
+column stores a compact variant label (`Chr_Start_Ref_Alt`) that will later be used to
+link the liftOver output back to the original table.
+
+```{r step01-bed}
+df <- read_excel("input_variants.xlsx", sheet = "Affected only all")
+
+bed <- df %>%
+  transmute(
+    chrom = paste0("chr", Chr),
+    start = as.integer(Start) - 1L,
+    end   = as.integer(Start),
+    name  = paste(Chr, Start, Ref, Alt, sep = "_")
+  ) %>%
+  distinct()
+
+dir.create("liftover_files", showWarnings = FALSE)
+write.table(bed, "liftover_files/step01_bed_hg19.txt",
+            sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+
+cat("BED rows written:", nrow(bed), "\n")
+```
+
+---
+
+# Step 2 — LiftOver hg19 → hg38 (Bash)
+
+Run UCSC liftOver to convert coordinates from hg19 to hg38.
+Download liftOver binary and chain file from [UCSC](https://hgdownload.soe.ucsc.edu/admin/exe/).
+
+```{bash step02-liftover, engine="bash"}
+liftOver \
+  liftover_files/step01_bed_hg19.txt \
+  hg19ToHg38.over.chain \
+  liftover_files/step02_mapped_hg38.txt \
+  liftover_files/step02_unmapped.txt
+
+echo "Mapped:"
+wc -l liftover_files/step02_mapped_hg38.txt
+
+echo "Unmapped:"
+wc -l liftover_files/step02_unmapped.txt
+```
+
+---
+
+# Step 3 — Integrate hg38 Coordinates (R)
+
+The hg38 coordinates from liftOver are merged back into the main variant table.
+A `canonical_key` (Chr_Start_Ref_Alt) is used as the join key. At this stage, the key is
+only used to reconnect the mapped coordinates to the original records; it is not yet the
+final normalized variant identifier used for gnomAD matching.
+
+```{r step03-integrate}
+df <- read_excel("input_variants.xlsx", sheet = "Affected only all")
+
+hg38 <- read.table("liftover_files/step02_mapped_hg38.txt",
+                   sep = "\t", header = FALSE,
+                   col.names = c("chrom38", "start38", "end38", "name")) %>%
+  mutate(
+    Chr38   = sub("chr", "", chrom38),
+    Start38 = as.integer(end38)
+  ) %>%
+  select(name, Chr38, Start38)
+
+df <- df %>%
+  mutate(canonical_key = paste(Chr, Start, Ref, Alt, sep = "_")) %>%
+  left_join(hg38, by = c("canonical_key" = "name"))
+
+wb <- createWorkbook()
+addWorksheet(wb, "variants_hg38")
+writeData(wb, "variants_hg38", df)
+saveWorkbook(wb, "step02_hg38_coords.xlsx", overwrite = TRUE)
+
+cat("Rows with hg38 coords:", sum(!is.na(df$Start38)), "\n")
+cat("Rows missing hg38 coords:", sum(is.na(df$Start38)), "\n")
+```
+
+---
+
+# Step 4 — Build VCF with Anchor Bases (R)
+
+For indels, a 1-bp anchor base is prepended to REF and ALT alleles as required by VCF specification.
+The `Biostrings` package is used to fetch the anchor base from the reference genome. This
+step is essential because indels must be represented in a valid VCF-compatible form before
+normalization and external database matching; otherwise, the same biological variant may
+fail to match the corresponding gnomAD record.
+
+```{r step04-vcf}
+library(Biostrings)
+
+df <- read_excel("step02_hg38_coords.xlsx", sheet = "variants_hg38")
+
+# Load reference genome
+ref_genome <- readDNAStringSet("reference/reference.fa")
+names(ref_genome) <- sub(" .*", "", names(ref_genome))
+
+get_anchor_base <- function(chrom, pos, ref_genome) {
+  chr_name <- paste0("chr", chrom)
+  if (!chr_name %in% names(ref_genome)) return(NA_character_)
+  as.character(subseq(ref_genome[[chr_name]], start = pos, end = pos))
+}
+
+df_vcf <- df %>%
+  filter(!is.na(Chr38), !is.na(Start38)) %>%
+  mutate(
+    is_indel    = nchar(Ref) != nchar(Alt),
+    anchor_base = ifelse(is_indel,
+                    mapply(get_anchor_base, Chr38, Start38 - 1, MoreArgs = list(ref_genome)),
+                    NA_character_),
+    VCF_POS     = ifelse(is_indel, Start38 - 1L, Start38),
+    VCF_REF     = ifelse(is_indel, paste0(anchor_base, Ref), Ref),
+    VCF_ALT     = ifelse(is_indel, paste0(anchor_base, Alt), Alt)
+  )
+
+# Save pre-bridge table
+write.csv(df_vcf, "step03_pre_bridge.csv", row.names = FALSE)
+
+# Write raw VCF
+vcf_lines <- c(
+  "##fileformat=VCFv4.2",
+  paste0("##reference=GRCh38"),
+  "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO"
+)
+vcf_data <- df_vcf %>%
+  transmute(
+    CHROM  = paste0("chr", Chr38),
+    POS    = VCF_POS,
+    ID     = ".",
+    REF    = VCF_REF,
+    ALT    = VCF_ALT,
+    QUAL   = ".",
+    FILTER = ".",
+    INFO   = "."
+  ) %>%
+  distinct() %>%
+  arrange(CHROM, POS)
+
+writeLines(c(vcf_lines,
+             apply(vcf_data, 1, paste, collapse = "\t")),
+           "step03_raw.vcf")
+
+cat("VCF rows written:", nrow(vcf_data), "\n")
+```
+
+---
+
+# Step 5 — Normalize VCF (Bash)
+
+The raw VCF is normalized using `bcftools norm` (left-align and split multi-allelic sites),
+then compressed with `bgzip` and indexed with `tabix`. Normalization is especially
+important because resources such as gnomAD store variants in normalized form, and exact
+matching becomes much more reliable after left-alignment and allele standardization.
+
+```{bash step05-normalize, engine="bash"}
+bcftools norm \
+  -f reference/reference.fa \
+  -m -any \
+  step03_raw.vcf \
+  -o step03_normalized.vcf
+
+bgzip -f step03_normalized.vcf
+tabix -p vcf step03_normalized.vcf.gz
+
+echo "Normalization complete."
+bcftools stats step03_normalized.vcf.gz | grep "^SN"
+```
+
+---
+
+# Step 6 — Build canonical_id Bridge Table (R)
+
+A bridge table is created that maps each original variant (Chr_Start_Ref_Alt in hg19)
+to its normalized hg38 representation (`canonical_id`).
+The `canonical_id` format is: `chrN-POS-REF-ALT` (hg38, normalized). This is the core
+identifier used throughout the rest of the pipeline, because it provides a stable bridge
+between the original spreadsheet representation and the normalized representation used for
+annotation.
+
+```{r step06-bridge}
+df_vcf <- read.csv("step03_pre_bridge.csv")
+
+# Read normalized VCF
+norm_vcf <- read.table("step03_normalized.vcf.gz",
+                    sep = "\t", comment.char = "#",
+                    col.names = c("CHROM","POS","ID","REF","ALT","QUAL","FILTER","INFO"))
+
+norm_vcf <- norm_vcf %>%
+  mutate(canonical_id = paste(CHROM, POS, REF, ALT, sep = "-"))
+
+# Build bridge: original key → canonical_id
+bridge <- df_vcf %>%
+  mutate(
+    CHROM = paste0("chr", Chr38),
+    POS   = VCF_POS,
+    REF   = VCF_REF,
+    ALT   = VCF_ALT
+  ) %>%
+  left_join(norm_vcf %>% select(CHROM, POS, REF, ALT, canonical_id),
+            by = c("CHROM", "POS", "REF", "ALT")) %>%
+  select(canonical_key, canonical_id) %>%
+  distinct()
+
+write.csv(bridge, "step05_bridge.csv", row.names = FALSE)
+cat("Bridge rows:", nrow(bridge), "\n")
+cat("canonical_id NAs:", sum(is.na(bridge$canonical_id)), "\n")
+```
+
+---
+
+# Step 7 — Add canonical_id to Main Table (R)
+
+The `canonical_id` from the bridge table is joined to the full variant table.
+This enables exact matching against gnomAD records in later steps.
+
+```{r step07-add-canonical}
+df <- read_excel("step02_hg38_coords.xlsx", sheet = "variants_hg38")
+bridge <- read.csv("step05_bridge.csv")
+
+df <- df %>%
+  left_join(bridge, by = "canonical_key")
+
+wb <- createWorkbook()
+addWorksheet(wb, "variants_annotated")
+writeData(wb, "variants_annotated", df)
+saveWorkbook(wb, "step06_with_canonical_id.xlsx", overwrite = TRUE)
+
+cat("Total rows:", nrow(df), "\n")
+cat("Rows with canonical_id:", sum(!is.na(df$canonical_id)), "\n")
+```
+
+---
+
+# Step 8 — Extract Unique Variants (R)
+
+A deduplicated list of unique variants (by `canonical_id`) is extracted.
+This list is used to generate per-chromosome region files for `bcftools query`.
+
+```{r step08-unique}
+df <- read_excel("step06_with_canonical_id.xlsx", sheet = "variants_annotated")
+
+unique_variants <- df %>%
+  filter(!is.na(canonical_id)) %>%
+  select(canonical_id, Chr38, Start38, Ref, Alt, VCF_POS, VCF_REF, VCF_ALT) %>%
+  distinct(canonical_id, .keep_all = TRUE)
+
+write.csv(unique_variants, "step07_unique_variants.csv", row.names = FALSE)
+cat("Unique variants:", nrow(unique_variants), "\n")
+```
+
+---
+
+# Step 9 — Generate Per-Chromosome Region Files (R)
+
+Region files (one per chromosome) are created for efficient `bcftools query`.
+Each file contains `CHROM\tPOS\tPOS` lines for the variants on that chromosome.
+
+```{r step09-regions}
+unique_variants <- read.csv("step07_unique_variants.csv")
+
+dir.create("query_regions", showWarnings = FALSE)
+
+unique_variants %>%
+  mutate(CHROM = paste0("chr", Chr38)) %>%
+  group_by(CHROM) %>%
+  group_walk(~ {
+    region_df <- .x %>%
+      transmute(CHROM = CHROM, START = VCF_POS, END = VCF_POS) %>%
+      distinct()
+    fname <- file.path("query_regions",
+                    paste0(unique(.x$CHROM), "_regions.tsv"))
+    write.table(region_df, fname,
+                sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+  })
+
+cat("Region files created:", length(list.files("query_regions")), "\n")
+```
+
+---
+
+# Step 10 — Query gnomAD VCF Files (Bash)
+
+For each chromosome, `bcftools query` extracts allele frequency and homozygosity
+data from the gnomAD v3.1.2 genome VCF files.
+
+**Fields extracted:** `CHROM`, `POS`, `REF`, `ALT`, `AF`, `AC`, `AN`, `nhomalt`,
+`AF_nfe`, `AC_nfe`, `AN_nfe`, `nhomalt_nfe`
+
+```{bash step10-gnomad-query, engine="bash"}
+mkdir -p gnomad_hits
+
+GNOMAD_DIR="gnomad_vcf"
+REGIONS_DIR="query_regions"
+
+for CHR in $(seq 1 22) X Y; do
+  REGION_FILE="${REGIONS_DIR}/chr${CHR}_regions.tsv"
+  VCF="${GNOMAD_DIR}/gnomad.genomes.v3.1.2.sites.chr${CHR}.vcf.bgz"
+  OUT="gnomad_hits/chr${CHR}_hits.tsv"
+
+  if [ -f "$REGION_FILE" ] && [ -f "$VCF" ]; then
+    bcftools query \
+      -R "$REGION_FILE" \
+      -f "%CHROM\t%POS\t%REF\t%ALT\t%INFO/AF\t%INFO/AC\t%INFO/AN\t%INFO/nhomalt\t%INFO/AF_nfe\t%INFO/AC_nfe\t%INFO/AN_nfe\t%INFO/nhomalt_nfe\n" \
+      "$VCF" > "$OUT"
+    echo "chr${CHR}: $(wc -l < $OUT) hits"
+  else
+    echo "chr${CHR}: skipped (missing file)"
+  fi
+done
+```
+
+---
+
+# Step 11 — Combine gnomAD Hit Files (R)
+
+All per-chromosome gnomAD hit files are merged into a single annotation table.
+A `canonical_id` is constructed from the gnomAD output for exact matching.
+
+```{r step11-combine}
+gnomad_files <- list.files("gnomad_hits", pattern = "_hits\\.tsv$", full.names = TRUE)
+
+gnomad_cols <- c("CHROM","POS","REF","ALT",
+                 "AF","AC","AN","nhomalt",
+                 "AF_nfe","AC_nfe","AN_nfe","nhomalt_nfe")
+
+gnomad_all <- map_dfr(gnomad_files, function(f) {
+  tryCatch(
+    read.table(f, sep = "\t", header = FALSE,
+               col.names = gnomad_cols, fill = TRUE,
+               quote = "", comment.char = ""),
+    error = function(e) NULL
+  )
+}) %>%
+  mutate(
+    canonical_id = paste(CHROM, POS, REF, ALT, sep = "-"),
+    across(c(AF, AC, AN, nhomalt, AF_nfe, AC_nfe, AN_nfe, nhomalt_nfe),
+           ~ suppressWarnings(as.numeric(.)))
+  ) %>%
+  distinct(canonical_id, .keep_all = TRUE)
+
+write.csv(gnomad_all, "step08_gnomad_annotations.csv", row.names = FALSE)
+
+cat("Total gnomAD variants found:", nrow(gnomad_all), "\n")
+cat("Unique canonical_ids:", n_distinct(gnomad_all$canonical_id), "\n")
+```
+
+---
+
+# Step 12 — Annotate Main Table with gnomAD Frequencies (R)
+
+The gnomAD annotations are joined to the full variant table using `canonical_id`.
+Variants without a gnomAD match (`AF = NA`) represent ultra-rare or novel variants
+not observed in the gnomAD v3.1.2 cohort (~750,000 genomes). However, lack of a gnomAD
+match should be interpreted as a rarity signal rather than direct evidence of pathogenicity,
+so this step supports prioritization but does not replace downstream biological review.
+
+```{r step12-annotate}
+df       <- read_excel("step06_with_canonical_id.xlsx", sheet = "variants_annotated")
+gnomad   <- read.csv("step08_gnomad_annotations.csv")
+
+gnomad_slim <- gnomad %>%
+  select(canonical_id, AF, AC, AN, nhomalt,
+         AF_nfe, AC_nfe, AN_nfe, nhomalt_nfe)
+
+df_annotated <- df %>%
+  left_join(gnomad_slim, by = "canonical_id")
+
+# QC summary
+cat("Total rows:", nrow(df_annotated), "\n")
+cat("gnomAD matched rows:", sum(!is.na(df_annotated$AF)), "\n")
+cat("gnomAD unmatched (ultra-rare / novel):", sum(is.na(df_annotated$AF)), "\n")
+cat("Final column count:", ncol(df_annotated), "\n")
+
+wb <- createWorkbook()
+addWorksheet(wb, "variants_gnomad")
+writeData(wb, "variants_gnomad", df_annotated)
+saveWorkbook(wb, "step09_annotated.xlsx", overwrite = TRUE)
+```
+
+---
+
+# Step 13 — Add variant_num and Prepare for Filtration (R)
+
+A new column `variant_num` is added, representing the number of **distinct patients**
+carrying each variant (identified by `canonical_id`). This recurrence metric is useful
+for prioritizing variants observed in multiple affected individuals.
+
+The `Patient` column is relocated before `canonical_id`, and `variant_num` is placed
+immediately after `Patient`. The result is saved as a new sheet `ready_for_filtration`
+in the same Excel file, preserving the original `variants_gnomad` sheet. This final
+layout is intended to make the next filtering stage more practical by placing patient-level
+recurrence information directly next to the main variant identifier.
+
+```{r step13-variant-num}
+df <- read_excel("step09_annotated.xlsx", sheet = "variants_gnomad")
+
+# Calculate variant_num: number of distinct patients per canonical_id
+variant_num_table <- df %>%
+  filter(!is.na(canonical_id), !is.na(Patient)) %>%
+  group_by(canonical_id) %>%
+  summarise(variant_num = n_distinct(Patient), .groups = "drop")
+
+# Join variant_num back to main table
+df <- df %>%
+  left_join(variant_num_table, by = "canonical_id")
+
+# Relocate columns: Patient → variant_num → canonical_id → rest
+df <- df %>%
+  relocate(Patient, .before = canonical_id) %>%
+  relocate(variant_num, .after = Patient)
+
+# QC summary
+cat("Total rows:", nrow(df), "\n")
+cat("Variants seen in >= 2 patients:", sum(df$variant_num >= 2, na.rm = TRUE), "\n")
+cat("Variants seen in >= 3 patients:", sum(df$variant_num >= 3, na.rm = TRUE), "\n")
+cat("Variants with NA variant_num:", sum(is.na(df$variant_num)), "\n")
+
+# Save as new sheet (keep variants_gnomad intact)
+wb <- loadWorkbook("step09_annotated.xlsx")
+if ("ready_for_filtration" %in% names(wb)) removeWorksheet(wb, "ready_for_filtration")
+addWorksheet(wb, "ready_for_filtration")
+writeData(wb, "ready_for_filtration", df)
+saveWorkbook(wb, "step09_annotated.xlsx", overwrite = TRUE)
+
+cat("Saved: ready_for_filtration sheet → step09_annotated.xlsx\n")
+```
+
+---
+
+# Pipeline File Flow
+
+```
+input_variants.xlsx  [Affected only all]
+        │
+        ▼ Step 1 (R)
+liftover_files/step01_bed_hg19.txt
+        │
+        ▼ Step 2 (Bash: liftOver)
+liftover_files/step02_mapped_hg38.txt
+        │
+        ▼ Step 3 (R)
+step02_hg38_coords.xlsx  [variants_hg38]
+        │
+        ▼ Step 4 (R: Biostrings)
+step03_pre_bridge.csv + step03_raw.vcf
+        │
+        ▼ Step 5 (Bash: bcftools norm + bgzip + tabix)
+step04_normalized.vcf.gz
+        │
+        ▼ Step 6 (R)
+step05_bridge.csv  [canonical_id]
+        │
+        ▼ Step 7 (R)
+step06_with_canonical_id.xlsx  [variants_annotated]
+        │
+        ▼ Step 8 (R)
+step07_unique_variants.csv
+        │
+        ▼ Step 9 (R) → query_regions/chrN_regions.tsv
+        │
+        ▼ Step 10 (Bash: bcftools query)
+gnomad_hits/chrN_hits.tsv
+        │
+        ▼ Step 11 (R)
+step08_gnomad_annotations.csv
+        │
+        ▼ Step 12 (R)
+step09_annotated.xlsx  [variants_gnomad]
+        │
+        ▼ Step 13 (R)
+step09_annotated.xlsx  [ready_for_filtration]  ← final output
+```
+
+---
+
+# Session Info
+
+```{r session-info, eval=TRUE}
+sessionInfo()
+```
